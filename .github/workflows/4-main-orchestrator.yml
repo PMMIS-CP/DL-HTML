@@ -1,0 +1,207 @@
+name: "Smart Page Downloader Orchestrator"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "URL of the page to download"
+        required: true
+        type: string
+      save_assets:
+        description: "Download CSS and JavaScript assets"
+        required: true
+        type: boolean
+        default: true
+      max_depth:
+        description: "Crawl depth (1 = single page)"
+        required: false
+        type: string
+        default: "1"
+      branch:
+        description: "Branch to commit the saved page"
+        required: true
+        type: string
+        default: "main"
+  schedule:
+    - cron: "0 0 * * 0"   # Every Sunday at 00:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: page-downloader-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  # ====================================================================
+  # Manual dispatch: single page download & commit
+  # ====================================================================
+  manual-run:
+    name: "Manual Download & Save"
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Browser simulation – fetch page HTML"
+        id: simulate
+        uses: ./.github/actions/browser-simulator
+        with:
+          url: ${{ inputs.target_url }}
+          user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          timeout: "30"
+          retries: "3"
+
+      - name: "Download assets (CSS/JS)"
+        id: download
+        if: inputs.save_assets == true
+        uses: ./.github/actions/download-page
+        with:
+          url: ${{ inputs.target_url }}
+          html-file: ${{ steps.simulate.outputs.html-path }}
+          user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          max-depth: ${{ inputs.max_depth }}
+          download-timeout: "15"
+
+      - name: "Commit downloaded files (with assets)"
+        id: save
+        if: success() && inputs.save_assets == true
+        uses: ./.github/actions/commit-to-repo
+        with:
+          source-folder: ${{ steps.download.outputs.page-folder }}
+          target-url: ${{ inputs.target_url }}
+          branch: ${{ inputs.branch }}
+          author-name: "GitHub Actions Bot"
+          author-email: "actions@github.com"
+          force-push: "true"
+
+      - name: "Commit HTML only (no assets)"
+        id: save-html-only
+        if: success() && inputs.save_assets == false
+        uses: ./.github/actions/commit-to-repo
+        with:
+          source-folder: ${{ steps.simulate.outputs.html-path }}  # works now with file support
+          target-url: ${{ inputs.target_url }}
+          branch: ${{ inputs.branch }}
+          author-name: "GitHub Actions Bot"
+          author-email: "actions@github.com"
+          force-push: "true"
+
+      - name: "Success notification"
+        if: success() && (steps.save.outputs.has-changes == 'true' || steps.save-html-only.outputs.has-changes == 'true')
+        run: |
+          echo "✅ Page saved successfully!"
+          echo "Commit: ${{ steps.save.outputs.commit-sha || steps.save-html-only.outputs.commit-sha }}"
+          echo "Folder: ${{ steps.save.outputs.page-folder || steps.save-html-only.outputs.page-folder }}"
+          if [ "${{ steps.simulate.outputs.content-valid }}" != "true" ]; then
+            echo "⚠️ Warning: downloaded HTML may be invalid – check logs"
+          fi
+
+      - name: "No changes notification"
+        if: success() && (steps.save.outputs.has-changes == 'false' || steps.save-html-only.outputs.has-changes == 'false')
+        run: echo "⚠️ No changes detected – page already up-to-date."
+
+      - name: "Failure notification"
+        if: failure()
+        run: |
+          echo "❌ Download/commit failed."
+          echo "Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # ====================================================================
+  # Scheduled: prepare list of sites from sites.txt (or sites.json)
+  # ====================================================================
+  prepare-matrix:
+    name: "Prepare site list for scheduled run"
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      sites: ${{ steps.build.outputs.sites_json }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Build JSON array of sites (from sites.txt or sites.json)"
+        id: build
+        run: |
+          SITES_JSON=""
+          if [ -f "sites.json" ]; then
+            echo "Using sites.json"
+            SITES_JSON=$(jq -c '.' sites.json)
+          elif [ -f "sites.txt" ]; then
+            echo "Parsing sites.txt"
+            # Remove carriage returns, comments, and blank lines using POSIX regex
+            SITES_JSON=$(sed 's/\r$//' sites.txt \
+              | grep -vE '^[[:space:]]*#' \
+              | grep -vE '^[[:space:]]*$' \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            # Fallback demo list
+            SITES_JSON='["https://example.com","https://example.org"]'
+            echo "No sites file found, using demo list."
+          fi
+          echo "sites_json=$SITES_JSON" >> "$GITHUB_OUTPUT"
+          echo "Sites to process: $SITES_JSON"
+
+  # ====================================================================
+  # Scheduled: process each site sequentially
+  # ====================================================================
+  scheduled-run:
+    name: "Scheduled download for ${{ matrix.site }}"
+    needs: prepare-matrix
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # Prevent push race conditions
+      matrix:
+        site: ${{ fromJSON(needs.prepare-matrix.outputs.sites) }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Browser simulation for ${{ matrix.site }}"
+        id: simulate
+        uses: ./.github/actions/browser-simulator
+        with:
+          url: ${{ matrix.site }}
+          user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          timeout: "30"
+          retries: "3"
+
+      - name: "Download assets for ${{ matrix.site }}"
+        id: download
+        uses: ./.github/actions/download-page
+        with:
+          url: ${{ matrix.site }}
+          html-file: ${{ steps.simulate.outputs.html-path }}
+          user-agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          max-depth: "1"
+          download-timeout: "15"
+
+      - name: "Commit for ${{ matrix.site }}"
+        id: save
+        if: success()
+        uses: ./.github/actions/commit-to-repo
+        with:
+          source-folder: ${{ steps.download.outputs.page-folder }}
+          target-url: ${{ matrix.site }}
+          branch: "main"
+          author-name: "GitHub Actions Bot"
+          author-email: "actions@github.com"
+          force-push: "true"
+
+      - name: "Log result for ${{ matrix.site }}"
+        if: always()
+        run: |
+          if [ "${{ steps.save.outputs.has-changes }}" = "true" ]; then
+            echo "✅ ${{ matrix.site }} saved successfully."
+          elif [ "${{ steps.save.outputs.has-changes }}" = "false" ]; then
+            echo "⚠️ ${{ matrix.site }} unchanged (already up-to-date)."
+          else
+            echo "❌ ${{ matrix.site }} failed during save."
+          fi
+          if [ "${{ steps.simulate.outputs.content-valid }}" != "true" ]; then
+            echo "⚠️ Warning: HTML validation failed for ${{ matrix.site }} – fallback page stored."
+          fi

@@ -1,0 +1,190 @@
+name: "Browser Simulator"
+description: "Fetch HTML page with realistic browser headers, robust retry & error handling"
+
+inputs:
+  url:
+    description: "Target URL"
+    required: true
+  user-agent:
+    description: "User agent string"
+    required: false
+    default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  timeout:
+    description: "Max time per request (seconds)"
+    required: false
+    default: "30"
+  retries:
+    description: "Number of retry attempts"
+    required: false
+    default: "3"
+
+outputs:
+  html-path:
+    description: "Path to saved HTML file (always exists, even on failure)"
+    value: ${{ steps.fetch.outputs.html_path }}
+  status-code:
+    description: "Raw HTTP status code from last server response (000 if never connected)"
+    value: ${{ steps.fetch.outputs.status_code }}
+  content-valid:
+    description: "Whether the HTML content passed basic validation"
+    value: ${{ steps.fetch.outputs.content_valid }}
+  log-path:
+    description: "Path to detailed curl/retry log"
+    value: ${{ steps.fetch.outputs.log_path }}
+
+runs:
+  using: "composite"
+  steps:
+    # ------------------------------------------------------------
+    # Step 1: Sanitize URL & create isolated cache directory
+    # ------------------------------------------------------------
+    - name: "Sanitize URL & create cache directory"
+      id: sanitize
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+      run: |
+        # Convert URL to safe directory name + short hash for uniqueness
+        SAFE_NAME=$(echo "$INPUT_URL" | sed -E 's|^https?://||i' | sed 's|/|_|g' | sed 's|[^a-zA-Z0-9_.-]|_|g' | sed 's/_\+/_/g' | sed 's/^_//;s/_$//' | cut -c1-180)
+        SAFE_NAME="${SAFE_NAME:-unknown_site}"
+        # Use sha256sum (more portable and collision-resistant than md5sum)
+        URL_HASH=$(echo -n "$INPUT_URL" | sha256sum | cut -c1-12)
+        SAFE_NAME="${SAFE_NAME}_${URL_HASH}"
+        CACHE_DIR="browser-cache/$SAFE_NAME"
+        mkdir -p "$CACHE_DIR"
+        echo "cache_dir=$CACHE_DIR" >> "$GITHUB_OUTPUT"
+        echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------
+    # Step 2: Fetch HTML with retry, backoff, and validation
+    # ------------------------------------------------------------
+    - name: "Fetch page with resilient retry & validation"
+      id: fetch
+      shell: bash
+      env:
+        CACHE_DIR: ${{ steps.sanitize.outputs.cache_dir }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_USER_AGENT: ${{ inputs.user-agent }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_RETRIES: ${{ inputs.retries }}
+      run: |
+        set +e   # Manual error handling
+
+        HTML_FILE="$CACHE_DIR/page.html"
+        LOG_FILE="$CACHE_DIR/curl.log"
+        HTTP_CODE="000"
+        FINAL_EXIT=0
+        MAX_RETRIES="${INPUT_RETRIES:-3}"
+        TIMEOUT="${INPUT_TIMEOUT:-30}"
+        CONTENT_VALID="false"
+
+        mkdir -p "$(dirname "$HTML_FILE")"
+
+        # Helper function to validate HTML content
+        is_valid_html() {
+            local file="$1"
+            [[ -f "$file" && -s "$file" ]] && grep -qiE '<html[^>]*>|<![dD][oO][cC][tT][yY][pP][eE]\s+html' "$file"
+        }
+
+        for attempt in $(seq 1 "$MAX_RETRIES"); do
+          echo "--- Attempt $attempt / $MAX_RETRIES ---" | tee -a "$LOG_FILE"
+          START_TIME=$(date +%s)
+
+          # Use an array for curl arguments to handle special characters safely
+          CURL_ARGS=(
+            -L
+            -A "$INPUT_USER_AGENT"
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            -H "Accept-Language: en-US,en;q=0.5"
+            -H "Accept-Encoding: gzip, deflate, br"
+            -H "DNT: 1"
+            -H "Connection: keep-alive"
+            -H "Upgrade-Insecure-Requests: 1"
+            --compressed
+            --max-time "$TIMEOUT"
+            --write-out "%{http_code}"
+            --output "$HTML_FILE"
+            --stderr "$LOG_FILE"
+            "$INPUT_URL"
+          )
+
+          # Execute curl, capture HTTP code
+          HTTP_CODE=$(curl "${CURL_ARGS[@]}" 2>>"$LOG_FILE")
+          CURL_EXIT=$?
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
+
+          echo "HTTP status: $HTTP_CODE, curl exit: $CURL_EXIT, time: ${ELAPSED}s" | tee -a "$LOG_FILE"
+
+          if [ "$HTTP_CODE" = "200" ] && [ $CURL_EXIT -eq 0 ] && is_valid_html "$HTML_FILE"; then
+            echo "Success on attempt $attempt" | tee -a "$LOG_FILE"
+            CONTENT_VALID="true"
+            FINAL_EXIT=0
+            break
+          fi
+
+          # Log specific failure reasons
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Warning: Non-200 status code ($HTTP_CODE)" | tee -a "$LOG_FILE"
+          fi
+          if [ $CURL_EXIT -ne 0 ]; then
+            echo "Warning: curl exited with error code $CURL_EXIT" | tee -a "$LOG_FILE"
+          fi
+          if ! is_valid_html "$HTML_FILE"; then
+            echo "Warning: Downloaded content is not valid HTML" | tee -a "$LOG_FILE"
+          fi
+
+          # If not last attempt, exponential backoff with jitter
+          if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+            BASE_SLEEP=$(( 2 ** (attempt-1) ))   # 1,2,4,8... seconds
+            JITTER=$(( RANDOM % 3 ))
+            SLEEP_TIME=$(( BASE_SLEEP + JITTER ))
+            echo "Retrying in ${SLEEP_TIME}s..." | tee -a "$LOG_FILE"
+            sleep "$SLEEP_TIME"
+          else
+            echo "All retries exhausted. Last HTTP: $HTTP_CODE, curl exit: $CURL_EXIT" | tee -a "$LOG_FILE"
+            FINAL_EXIT=$CURL_EXIT
+          fi
+        done
+
+        # ---------------------------------------------------------
+        # Fallback HTML if content still invalid (no status override)
+        # ---------------------------------------------------------
+        if ! is_valid_html "$HTML_FILE"; then
+          cat > "$HTML_FILE" <<FALLBACK_EOF
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Download Failed</title></head>
+<body>
+  <h1>Page fetch failed after ${MAX_RETRIES} attempts</h1>
+  <p>URL: ${INPUT_URL}</p>
+  <p>Last HTTP status code: ${HTTP_CODE}</p>
+</body>
+</html>
+FALLBACK_EOF
+          echo "Created fallback error HTML." | tee -a "$LOG_FILE"
+          # We intentionally do NOT fail the step – caller should check content-valid
+          FINAL_EXIT=0
+          CONTENT_VALID="false"
+        fi
+
+        # ------------------- Outputs -------------------
+        echo "status_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
+        echo "content_valid=$CONTENT_VALID" >> "$GITHUB_OUTPUT"
+        echo "html_path=$HTML_FILE" >> "$GITHUB_OUTPUT"
+        echo "log_path=$LOG_FILE" >> "$GITHUB_OUTPUT"
+
+        # Summary
+        echo "--------------------------------------------------"
+        echo "Browser simulation completed:"
+        echo "  URL: $INPUT_URL"
+        echo "  Raw HTTP status: $HTTP_CODE"
+        echo "  Content valid: $CONTENT_VALID"
+        if [ -f "$HTML_FILE" ]; then
+          SIZE=$(du -h "$HTML_FILE" | cut -f1)
+          echo "  HTML size: $SIZE"
+        fi
+        echo "  Log file: $LOG_FILE"
+        echo "--------------------------------------------------"
+
+        exit $FINAL_EXIT
