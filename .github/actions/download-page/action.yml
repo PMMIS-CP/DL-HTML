@@ -132,9 +132,10 @@ runs:
           echo "HTTP status: $HTTP_CODE (curl exit: $CURL_EXIT)" | tee -a "$LOG_FILE"
           if [ "$HTTP_CODE" != "200" ] || [ ! -s "$HTML_FILE" ]; then
             echo "Warning: Page download failed or returned non-200. Check $LOG_FILE"
-            cat > "$HTML_FILE" <<FALLBACK
-<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Failed to download $INPUT_URL</h1><p>HTTP $HTTP_CODE</p></body></html>
-FALLBACK
+            echo '<!DOCTYPE html><html><head><title>Error</title></head><body>' > "$HTML_FILE"
+            echo '<h1>Failed to download '"$INPUT_URL"'</h1>' >> "$HTML_FILE"
+            echo '<p>HTTP '"$HTTP_CODE"'</p>' >> "$HTML_FILE"
+            echo '</body></html>' >> "$HTML_FILE"
             HTTP_CODE="${HTTP_CODE:-500}"
           fi
         fi
