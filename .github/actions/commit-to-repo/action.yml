@@ -178,21 +178,21 @@ runs:
         shopt -u dotglob
 
         # Generate README.md
-        cat > "$DEST/README.md" <<README_EOF
-# Saved Page: ${INPUT_TARGET_URL}
-
-- **Save Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-- **Author:** ${INPUT_AUTHOR_NAME}
-- **Branch:** ${INPUT_BRANCH}
-
-## Directory Structure
-\`\`\`
-$(find "$DEST" -maxdepth 2 -not -path '*/\.*' | sort | head -30)
-\`\`\`
-
-## Main File
-\`index.html\` (inside \`html/\` folder if available)
-README_EOF
+        {
+          echo '# Saved Page: '"${INPUT_TARGET_URL}"
+          echo ''
+          echo '- **Save Date:** '"$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo '- **Author:** '"${INPUT_AUTHOR_NAME}"
+          echo '- **Branch:** '"${INPUT_BRANCH}"
+          echo ''
+          echo '## Directory Structure'
+          echo '```'
+          find "$DEST" -maxdepth 2 -not -path '*/\.*' | sort | head -30
+          echo '```'
+          echo ''
+          echo '## Main File'
+          echo '`index.html` (inside `html/` folder if available)'
+        } > "$DEST/README.md"
 
         # Metadata files
         echo "$(date -u +"%Y-%m-%d %H:%M:%S UTC")" > "$DEST/.download-timestamp"
