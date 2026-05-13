@@ -147,23 +147,19 @@ runs:
           fi
         done
 
-        # ---------------------------------------------------------
-        # Fallback HTML if content still invalid (no status override)
-        # ---------------------------------------------------------
         if ! is_valid_html "$HTML_FILE"; then
-          cat > "$HTML_FILE" << 'FALLBACK_EOF'
-<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Download Failed</title></head>
-<body>
-  <h1>Page fetch failed after ${MAX_RETRIES} attempts</h1>
-  <p>URL: ${INPUT_URL}</p>
-  <p>Last HTTP status code: ${HTTP_CODE}</p>
-</body>
-</html>
-FALLBACK_EOF
+          cat > "$HTML_FILE" <<- 'FALLBACK_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="UTF-8"><title>Download Failed</title></head>
+          <body>
+            <h1>Page fetch failed after ${MAX_RETRIES} attempts</h1>
+            <p>URL: ${INPUT_URL}</p>
+            <p>Last HTTP status code: ${HTTP_CODE}</p>
+          </body>
+          </html>
+          FALLBACK_EOF
           echo "Created fallback error HTML." | tee -a "$LOG_FILE"
-          # We intentionally do NOT fail the step – caller should check content-valid
           FINAL_EXIT=0
           CONTENT_VALID="false"
         fi
