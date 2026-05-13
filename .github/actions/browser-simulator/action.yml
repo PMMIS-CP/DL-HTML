@@ -148,17 +148,15 @@ runs:
         done
 
         if ! is_valid_html "$HTML_FILE"; then
-          cat > "$HTML_FILE" <<- 'FALLBACK_EOF'
-          <!DOCTYPE html>
-          <html lang="en">
-          <head><meta charset="UTF-8"><title>Download Failed</title></head>
-          <body>
-            <h1>Page fetch failed after ${MAX_RETRIES} attempts</h1>
-            <p>URL: ${INPUT_URL}</p>
-            <p>Last HTTP status code: ${HTTP_CODE}</p>
-          </body>
-          </html>
-          FALLBACK_EOF
+          printf '%s\n' '<!DOCTYPE html>' > "$HTML_FILE"
+          printf '%s\n' '<html lang="en">' >> "$HTML_FILE"
+          printf '%s\n' '<head><meta charset="UTF-8"><title>Download Failed</title></head>' >> "$HTML_FILE"
+          printf '%s\n' '<body>' >> "$HTML_FILE"
+          printf '%s\n' '  <h1>Page fetch failed after '"${MAX_RETRIES}"' attempts</h1>' >> "$HTML_FILE"
+          printf '%s\n' '  <p>URL: '"${INPUT_URL}"'</p>' >> "$HTML_FILE"
+          printf '%s\n' '  <p>Last HTTP status code: '"${HTTP_CODE}"'</p>' >> "$HTML_FILE"
+          printf '%s\n' '</body>' >> "$HTML_FILE"
+          printf '%s\n' '</html>' >> "$HTML_FILE"
           echo "Created fallback error HTML." | tee -a "$LOG_FILE"
           FINAL_EXIT=0
           CONTENT_VALID="false"
