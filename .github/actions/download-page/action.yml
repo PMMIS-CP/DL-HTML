@@ -1,0 +1,223 @@
+name: "Smart Page Downloader (HTML/CSS/JS only)"
+description: "Download HTML, CSS, and JavaScript assets with safe parsing, validation & Content-Type detection"
+
+inputs:
+  url:
+    description: "Target URL (required if html-file not given)"
+    required: false
+    default: ""
+  html-file:
+    description: "Path to pre-downloaded HTML file (if provided, skips page download)"
+    required: false
+    default: ""
+  output-dir:
+    description: "Root output directory"
+    required: false
+    default: "downloads"
+  user-agent:
+    description: "User agent string"
+    required: false
+    default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  max-depth:
+    description: "Crawl depth (1=single page)"
+    required: false
+    default: "1"
+  download-timeout:
+    description: "Timeout per asset in seconds"
+    required: false
+    default: "15"
+  preserve-protocol:
+    description: "Keep original protocol for protocol-relative URLs ('true'/'false')"
+    required: false
+    default: "false"
+
+outputs:
+  page-folder:
+    description: "Page-specific folder path"
+    value: ${{ steps.structure.outputs.page_folder }}
+  html-file:
+    description: "Path to main HTML file"
+    value: ${{ steps.download-html.outputs.html_path }}
+  assets-count:
+    description: "Total CSS + JS files downloaded"
+    value: ${{ steps.summary.outputs.total_assets }}
+
+runs:
+  using: "composite"
+  steps:
+    # -----------------------------------------------
+    # Step 1: Create folder structure from URL
+    # -----------------------------------------------
+    - name: "Generate safe folder name and structure"
+      id: structure
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_HTML_FILE: ${{ inputs.html-file }}
+        INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        if [ -n "$INPUT_HTML_FILE" ]; then
+          URL_FOR_NAME="file://$INPUT_HTML_FILE"
+        else
+          URL_FOR_NAME="$INPUT_URL"
+        fi
+
+        SAFE_NAME=$(echo "$URL_FOR_NAME" | \
+          sed -E 's|^https?://||i; s|^file://||i' | \
+          sed 's|/|_|g' | \
+          sed 's|[^a-zA-Z0-9_.-]|_|g' | \
+          sed 's/_\+/_/g' | \
+          sed 's/^_//;s/_$//' | \
+          cut -c1-150)
+        SAFE_NAME="${SAFE_NAME:-unknown_page}"
+
+        URL_HASH=$(echo -n "$URL_FOR_NAME" | sha256sum | cut -c1-12)
+        SAFE_NAME="${SAFE_NAME}_${URL_HASH}"
+
+        PAGE_DIR="${INPUT_OUTPUT_DIR}/${SAFE_NAME}"
+        mkdir -p "$PAGE_DIR/html"
+        mkdir -p "$PAGE_DIR/assets/css"
+        mkdir -p "$PAGE_DIR/assets/js"
+        mkdir -p "$PAGE_DIR/logs"
+
+        echo "page_folder=$PAGE_DIR" >> "$GITHUB_OUTPUT"
+        echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------
+    # Step 2: Download or copy main HTML
+    # -----------------------------------------------
+    - name: "Obtain main HTML (download or use provided file)"
+      id: download-html
+      shell: bash
+      env:
+        PAGE_DIR: ${{ steps.structure.outputs.page_folder }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_HTML_FILE: ${{ inputs.html-file }}
+        INPUT_USER_AGENT: ${{ inputs.user-agent }}
+      run: |
+        HTML_FILE="$PAGE_DIR/html/index.html"
+        LOG_FILE="$PAGE_DIR/logs/curl-details.log"
+
+        if [ -n "$INPUT_HTML_FILE" ]; then
+          if [ ! -f "$INPUT_HTML_FILE" ]; then
+            echo "Error: Provided HTML file does not exist: $INPUT_HTML_FILE"
+            exit 1
+          fi
+          cp "$INPUT_HTML_FILE" "$HTML_FILE"
+          echo "Using pre-downloaded HTML: $INPUT_HTML_FILE"
+          HTTP_CODE=200
+        else
+          HTTP_CODE=$(curl -L "$INPUT_URL" \
+            -A "$INPUT_USER_AGENT" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.5" \
+            -H "Accept-Encoding: gzip, deflate, br" \
+            -H "DNT: 1" \
+            -H "Connection: keep-alive" \
+            -H "Upgrade-Insecure-Requests: 1" \
+            --compressed \
+            --max-time 45 \
+            --retry 2 \
+            --retry-delay 2 \
+            --silent \
+            --show-error \
+            --write-out '%{http_code}' \
+            --output "$HTML_FILE" \
+            > "$LOG_FILE" 2>&1)
+          CURL_EXIT=$?
+          echo "HTTP status: $HTTP_CODE (curl exit: $CURL_EXIT)" | tee -a "$LOG_FILE"
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s "$HTML_FILE" ]; then
+            echo "Warning: Page download failed or returned non-200. Check $LOG_FILE"
+            echo '<!DOCTYPE html><html><head><title>Error</title></head><body>' > "$HTML_FILE"
+            echo '<h1>Failed to download '"$INPUT_URL"'</h1>' >> "$HTML_FILE"
+            echo '<p>HTTP '"$HTTP_CODE"'</p>' >> "$HTML_FILE"
+            echo '</body></html>' >> "$HTML_FILE"
+            HTTP_CODE="${HTTP_CODE:-500}"
+          fi
+        fi
+
+        echo "http_status=$HTTP_CODE" >> "$GITHUB_OUTPUT"
+        echo "html_path=$HTML_FILE" >> "$GITHUB_OUTPUT"
+        SIZE=$(stat -c%s "$HTML_FILE" 2>/dev/null || echo 0)
+        echo "HTML ready: $SIZE bytes (HTTP $HTTP_CODE)"
+
+    # -----------------------------------------------
+    # Step 3: Extract and download assets with Python
+    # -----------------------------------------------
+    - name: "Parse HTML and download all CSS/JS"
+      id: download-assets
+      shell: bash
+      env:
+        PAGE_DIR: ${{ steps.structure.outputs.page_folder }}
+        HTML_FILE: ${{ steps.download-html.outputs.html_path }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_USER_AGENT: ${{ inputs.user-agent }}
+        INPUT_DOWNLOAD_TIMEOUT: ${{ inputs.download-timeout }}
+        INPUT_PRESERVE_PROTOCOL: ${{ inputs.preserve-protocol }}
+      run: |
+        python3 "${{ github.action_path }}/download-assets.py"
+
+    # -----------------------------------------------
+    # Step 4: Metadata & final report
+    # -----------------------------------------------
+    - name: "Create metadata and final report"
+      id: metadata
+      shell: bash
+      env:
+        PAGE_DIR: ${{ steps.structure.outputs.page_folder }}
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_USER_AGENT: ${{ inputs.user-agent }}
+        INPUT_MAX_DEPTH: ${{ inputs.max-depth }}
+        HTTP_STATUS: ${{ steps.download-html.outputs.http_status }}
+      run: |
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        HTML_SIZE=$(stat -c%s "$PAGE_DIR/html/index.html" 2>/dev/null || echo 0)
+        CSS_COUNT=$(find "$PAGE_DIR/assets/css" -type f -name "*.css" 2>/dev/null | wc -l)
+        JS_COUNT=$(find "$PAGE_DIR/assets/js" -type f -name "*.js" 2>/dev/null | wc -l)
+        TOTAL_ASSETS=$((CSS_COUNT + JS_COUNT))
+
+        jq -n \
+          --arg url "${INPUT_URL:-file}" \
+          --arg date "$TIMESTAMP" \
+          --arg ua "$INPUT_USER_AGENT" \
+          --arg depth "$INPUT_MAX_DEPTH" \
+          --arg status "$HTTP_STATUS" \
+          --argjson html_size "$HTML_SIZE" \
+          --argjson css_count "$CSS_COUNT" \
+          --argjson js_count "$JS_COUNT" \
+          --argjson total "$TOTAL_ASSETS" \
+          '{
+            url: $url,
+            download_date: $date,
+            user_agent: $ua,
+            max_depth: $depth,
+            http_status: $status,
+            stats: {
+              html_size_bytes: $html_size,
+              css_count: $css_count,
+              js_count: $js_count,
+              total_assets: $total
+            }
+          }' > "$PAGE_DIR/logs/download-info.json"
+
+        echo "html_size=$HTML_SIZE" >> "$GITHUB_OUTPUT"
+        echo "css_count=$CSS_COUNT" >> "$GITHUB_OUTPUT"
+        echo "js_count=$JS_COUNT" >> "$GITHUB_OUTPUT"
+        echo "total_assets=$TOTAL_ASSETS" >> "$GITHUB_OUTPUT"
+
+        echo "Download completed for ${INPUT_URL:-file}"
+        echo "  Folder: $PAGE_DIR"
+        echo "  HTML size: $HTML_SIZE bytes"
+        echo "  Assets: CSS=$CSS_COUNT, JS=$JS_COUNT"
+
+    # -----------------------------------------------
+    # Step 5: Final outputs
+    # -----------------------------------------------
+    - name: "Set final outputs"
+      id: summary
+      shell: bash
+      env:
+        PAGE_DIR: ${{ steps.structure.outputs.page_folder }}
+      run: |
+        TOTAL=$(find "$PAGE_DIR/assets" -type f 2>/dev/null | wc -l)
+        echo "total_assets=$TOTAL" >> "$GITHUB_OUTPUT"

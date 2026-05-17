@@ -1,0 +1,372 @@
+name: "Permanent Repository Storage"
+description: "Create commit with downloaded files in designated folder"
+
+inputs:
+  source-folder:
+    description: "Source folder or single file containing downloaded content"
+    required: true
+  target-url:
+    description: "Original page URL for naming"
+    required: true
+  commit-message:
+    description: "Custom commit message (optional)"
+    required: false
+    default: ""
+  author-name:
+    description: "Commit author name"
+    required: false
+    default: "GitHub Actions Bot"
+  author-email:
+    description: "Commit author email"
+    required: false
+    default: "actions@github.com"
+  branch:
+    description: "Target branch for commit"
+    required: false
+    default: "main"
+  force-push:
+    description: "Use force-with-lease for push ('true' or 'false')"
+    required: false
+    default: "true"
+
+outputs:
+  commit-sha:
+    description: "Created commit SHA hash"
+    value: ${{ steps.commit.outputs.commit_sha }}
+  page-folder:
+    description: "Final storage path in repository"
+    value: ${{ steps.move.outputs.final_path }}
+  has-changes:
+    description: "Whether changes were committed"
+    value: ${{ steps.commit.outputs.has_changes }}
+
+runs:
+  using: "composite"
+  steps:
+    # -----------------------------------------------
+    # Step 1: Configure Git author
+    # -----------------------------------------------
+    - name: "Configure Git author"
+      shell: bash
+      env:
+        AUTHOR_NAME: ${{ inputs.author-name }}
+        AUTHOR_EMAIL: ${{ inputs.author-email }}
+      run: |
+        git config user.name "$AUTHOR_NAME"
+        git config user.email "$AUTHOR_EMAIL"
+        echo "Git configured: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+
+    # -----------------------------------------------
+    # Step 2: Safe branch switching & sync
+    # -----------------------------------------------
+    - name: "Ensure correct branch and sync"
+      id: branch-setup
+      shell: bash
+      env:
+        TARGET_BRANCH: ${{ inputs.branch }}
+      run: |
+        set -e
+        echo "Target branch: $TARGET_BRANCH"
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        echo "Currently on: $CURRENT_BRANCH"
+
+        # Fetch remote branch (shallow)
+        git fetch origin "$TARGET_BRANCH" --depth=1 2>/dev/null || echo "Remote branch $TARGET_BRANCH not found yet"
+
+        # Switch to the target branch (or create if not exists)
+        if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+          if [ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ]; then
+            echo "Switching to local branch $TARGET_BRANCH"
+            git switch "$TARGET_BRANCH"
+          fi
+        elif git show-ref --verify --quiet "refs/remotes/origin/$TARGET_BRANCH"; then
+          echo "Creating local branch from origin/$TARGET_BRANCH"
+          git switch -c "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+        else
+          echo "Creating orphan branch $TARGET_BRANCH"
+          git checkout --orphan "$TARGET_BRANCH"
+          # Do not remove files; we will stage only the new content
+        fi
+
+        # If remote exists, ensure we're up to date (fast-forward only)
+        if git show-ref --verify --quiet "refs/remotes/origin/$TARGET_BRANCH"; then
+          echo "Syncing with origin/$TARGET_BRANCH"
+          git merge --ff-only "origin/$TARGET_BRANCH" 2>/dev/null || {
+            echo "Warning: cannot fast-forward; local branch may have diverged."
+            echo "Current HEAD: $(git rev-parse HEAD)"
+          }
+        fi
+
+        echo "Now on branch: $(git rev-parse --abbrev-ref HEAD) at $(git rev-parse HEAD)"
+
+    # -----------------------------------------------
+    # Step 3: Generate standardized folder name
+    # -----------------------------------------------
+    - name: "Generate folder name from URL"
+      id: folder-name
+      shell: bash
+      env:
+        INPUT_TARGET_URL: ${{ inputs.target-url }}
+      run: |
+        # Clean URL to safe base name
+        FOLDER_BASE=$(echo "$INPUT_TARGET_URL" | \
+          sed -E 's|^https?://||i' | \
+          sed 's|/|_|g' | \
+          sed 's|[^a-zA-Z0-9_.-]|_|g' | \
+          sed 's/_\+/_/g' | \
+          sed 's/^_//;s/_$//' | \
+          cut -c1-100)
+        FOLDER_BASE="${FOLDER_BASE:-unknown_site}"
+        # Add short hash for uniqueness
+        URL_HASH=$(echo -n "$INPUT_TARGET_URL" | sha256sum | cut -c1-12)
+        DATE_SUFFIX=$(date -u +"%Y%m%d_%H%M%S")
+        FINAL_NAME="${FOLDER_BASE}_${URL_HASH}_${DATE_SUFFIX}"
+        echo "folder_name=$FINAL_NAME" >> "$GITHUB_OUTPUT"
+        echo "date_suffix=$DATE_SUFFIX" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------
+    # Step 4: Prepare source (handle both file & folder)
+    # -----------------------------------------------
+    - name: "Prepare source content"
+      id: prepare
+      shell: bash
+      env:
+        INPUT_SOURCE_FOLDER: ${{ inputs.source-folder }}
+        FOLDER_NAME: ${{ steps.folder-name.outputs.folder_name }}
+      run: |
+        ORIG_SOURCE="$INPUT_SOURCE_FOLDER"
+        EFFECTIVE_SOURCE=""
+
+        if [ -f "$ORIG_SOURCE" ]; then
+          # Single file input – wrap into a temporary directory structure
+          TEMP_DIR="tmp-commit-${FOLDER_NAME}"
+          mkdir -p "$TEMP_DIR/html"
+          cp "$ORIG_SOURCE" "$TEMP_DIR/html/index.html"
+          EFFECTIVE_SOURCE="$TEMP_DIR"
+          echo "Single file detected – wrapped into directory: $EFFECTIVE_SOURCE"
+        elif [ -d "$ORIG_SOURCE" ]; then
+          EFFECTIVE_SOURCE="$ORIG_SOURCE"
+          echo "Directory source: $EFFECTIVE_SOURCE"
+        else
+          echo "Error: source-folder does not exist or is not a file/directory: $ORIG_SOURCE"
+          exit 1
+        fi
+
+        echo "effective_source=$EFFECTIVE_SOURCE" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------
+    # Step 5: Copy files to final repository location
+    # -----------------------------------------------
+    - name: "Copy files to saved-pages/"
+      id: move
+      shell: bash
+      env:
+        EFFECTIVE_SOURCE: ${{ steps.prepare.outputs.effective_source }}
+        FOLDER_NAME: ${{ steps.folder-name.outputs.folder_name }}
+        INPUT_TARGET_URL: ${{ inputs.target-url }}
+        INPUT_AUTHOR_NAME: ${{ inputs.author-name }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+      run: |
+        SOURCE="$EFFECTIVE_SOURCE"
+        DEST="saved-pages/$FOLDER_NAME"
+
+        mkdir -p "$DEST"
+
+        # Copy all files including hidden ones (important for logs)
+        shopt -s dotglob
+        cp -r "$SOURCE"/* "$DEST/" 2>/dev/null || true
+        shopt -u dotglob
+
+        # Generate README.md
+        {
+          echo '# Saved Page: '"${INPUT_TARGET_URL}"
+          echo ''
+          echo '- **Save Date:** '"$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo '- **Author:** '"${INPUT_AUTHOR_NAME}"
+          echo '- **Branch:** '"${INPUT_BRANCH}"
+          echo ''
+          echo '## Directory Structure'
+          echo '```'
+          find "$DEST" -maxdepth 2 -not -path '*/\.*' | sort | head -30
+          echo '```'
+          echo ''
+          echo '## Main File'
+          echo '`index.html` (inside `html/` folder if available)'
+        } > "$DEST/README.md"
+
+        # Metadata files
+        echo "$(date -u +"%Y-%m-%d %H:%M:%S UTC")" > "$DEST/.download-timestamp"
+        echo "$INPUT_TARGET_URL" > "$DEST/.source-url"
+
+        echo "final_path=$DEST" >> "$GITHUB_OUTPUT"
+        FILE_COUNT=$(find "$DEST" -type f | wc -l)
+        DIR_SIZE=$(du -sh "$DEST" | cut -f1)
+        echo "Files copied: $FILE_COUNT, Size: $DIR_SIZE"
+
+    # -----------------------------------------------
+    # Step 6: Generate commit message
+    # -----------------------------------------------
+    - name: "Generate or use custom commit message"
+      id: commit-msg
+      shell: bash
+      env:
+        INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        INPUT_TARGET_URL: ${{ inputs.target-url }}
+      run: |
+        if [ -n "$INPUT_COMMIT_MESSAGE" ]; then
+          MSG="$INPUT_COMMIT_MESSAGE"
+        else
+          PAGE_NAME=$(echo "$INPUT_TARGET_URL" | sed -E 's|^https?://||i' | cut -c1-80)
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S")
+          MSG="Save webpage: $PAGE_NAME at $TIMESTAMP"
+        fi
+
+        # Truncate if too long
+        if [ ${#MSG} -gt 500 ]; then
+          MSG="${MSG:0:497}..."
+        fi
+
+        # Store message in a file to avoid shell escaping issues
+        MSG_FILE=$(mktemp)
+        echo "$MSG" > "$MSG_FILE"
+        echo "msg_file=$MSG_FILE" >> "$GITHUB_OUTPUT"
+        echo "Commit message: $MSG"
+
+    # -----------------------------------------------
+    # Step 7: Commit and push with robust retry
+    # -----------------------------------------------
+    - name: "Commit and push to repository"
+      id: commit
+      shell: bash
+      env:
+        FINAL_PATH: ${{ steps.move.outputs.final_path }}
+        MSG_FILE: ${{ steps.commit-msg.outputs.msg_file }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_FORCE_PUSH: ${{ inputs.force-push }}
+      run: |
+        set -e
+        # Stage only the newly added folder
+        git add "$FINAL_PATH"
+
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git status --short | head -20
+        git commit -F "$MSG_FILE"
+        COMMIT_HASH=$(git rev-parse HEAD)
+        echo "commit_sha=$COMMIT_HASH" >> "$GITHUB_OUTPUT"
+        echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+        # Push with retry and safe update
+        MAX_RETRIES=3
+        RETRY_DELAY=5
+        BRANCH="$INPUT_BRANCH"
+
+        for i in $(seq 1 $MAX_RETRIES); do
+          echo "Push attempt $i / $MAX_RETRIES"
+          if [ "$INPUT_FORCE_PUSH" = "true" ]; then
+            PUSH_CMD="git push --force-with-lease origin HEAD:$BRANCH"
+          else
+            PUSH_CMD="git push origin HEAD:$BRANCH"
+          fi
+
+          if $PUSH_CMD; then
+            echo "Push succeeded"
+            break
+          else
+            echo "Push failed. Syncing with remote and integrating changes..."
+            git fetch origin "$BRANCH" --depth=1
+            # Attempt rebase; if fails, fallback to merge with 'ours' strategy
+            if git rebase "origin/$BRANCH" 2>/dev/null; then
+              echo "Rebase successful, retrying push..."
+            else
+              echo "Rebase conflict detected. Aborting rebase and attempting merge..."
+              git rebase --abort
+              # Merge keeping our version of any conflicting files
+              if git merge "origin/$BRANCH" -X ours -m "Merge remote-tracking branch 'origin/$BRANCH' keeping local changes"; then
+                echo "Merge successful, retrying push..."
+              else
+                echo "ERROR: Automatic merge also failed. Manual intervention required."
+                exit 1
+              fi
+            fi
+          fi
+
+          if [ $i -eq $MAX_RETRIES ]; then
+            echo "ERROR: Push failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          sleep "$RETRY_DELAY"
+        done
+
+        echo "Committed: $COMMIT_HASH"
+        echo "Changes pushed to $BRANCH"
+
+    # -----------------------------------------------
+    # Step 8: Final report
+    # -----------------------------------------------
+    - name: "Generate final report"
+      shell: bash
+      env:
+        HAS_CHANGES: ${{ steps.commit.outputs.has_changes }}
+        COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        FINAL_PATH: ${{ steps.move.outputs.final_path }}
+        INPUT_TARGET_URL: ${{ inputs.target-url }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+      run: |
+        if [ "$HAS_CHANGES" = "false" ]; then
+          echo "No changes detected – page already stored"
+        elif [ "$COMMIT_SHA" = "skipped" ]; then
+          echo "Commit skipped – no new content"
+        else
+          echo "Successfully saved page to repository"
+          echo "URL: $INPUT_TARGET_URL"
+          echo "Folder: $FINAL_PATH"
+          echo "Commit: $COMMIT_SHA"
+          echo "Branch: $INPUT_BRANCH"
+          echo "Time: $(date)"
+        fi
+
+    # -----------------------------------------------
+    # Step 9: Cleanup on failure & temporary files
+    # -----------------------------------------------
+    - name: "Cleanup on failure"
+      if: failure()
+      shell: bash
+      env:
+        FINAL_PATH: ${{ steps.move.outputs.final_path }}
+        EFFECTIVE_SOURCE: ${{ steps.prepare.outputs.effective_source }}
+        INPUT_SOURCE_FOLDER: ${{ inputs.source-folder }}
+      run: |
+        echo "Commit operation failed, cleaning up staged files..."
+        # Remove the final destination folder (if exists) and reset git index
+        if [ -n "$FINAL_PATH" ] && [ -d "$FINAL_PATH" ]; then
+          rm -rf "$FINAL_PATH"
+          echo "Removed: $FINAL_PATH"
+        fi
+        # If a temporary wrapper directory was created, remove it
+        if [ "$EFFECTIVE_SOURCE" != "$INPUT_SOURCE_FOLDER" ] && [ -d "$EFFECTIVE_SOURCE" ]; then
+          rm -rf "$EFFECTIVE_SOURCE"
+          echo "Removed temporary source: $EFFECTIVE_SOURCE"
+        fi
+        git reset --hard HEAD 2>/dev/null || true
+        git clean -fd 2>/dev/null || true
+        exit 1
+
+    - name: "Cleanup temporary source on success"
+      if: success()
+      shell: bash
+      env:
+        EFFECTIVE_SOURCE: ${{ steps.prepare.outputs.effective_source }}
+        INPUT_SOURCE_FOLDER: ${{ inputs.source-folder }}
+      run: |
+        # Remove the temp directory if we created one
+        if [ "$EFFECTIVE_SOURCE" != "$INPUT_SOURCE_FOLDER" ] && [ -d "$EFFECTIVE_SOURCE" ]; then
+          rm -rf "$EFFECTIVE_SOURCE"
+          echo "Removed temporary source: $EFFECTIVE_SOURCE"
+        fi
