@@ -1,0 +1,13 @@
+{
+  "url": "https://example.org",
+  "download_date": "2026-06-14T02:06:04Z",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "max_depth": "1",
+  "http_status": "200",
+  "stats": {
+    "html_size_bytes": 559,
+    "css_count": 0,
+    "js_count": 0,
+    "total_assets": 0
+  }
+}
